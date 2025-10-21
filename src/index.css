@@ -1,18 +1,34 @@
+/*----------------------------------------------------------------------
+ File: src/index.css
+ Purpose: Global base stylesheet for the renderer.
+          Provides a clean default look across browsers,
+          sets up full-viewport layout, and ensures
+          fonts render crisply on both dark and light themes.
+ Notes:
+   • This runs once (imported by main.jsx).
+   • Keep it minimal—component-specific styles should live inline or in modules.
+ Owner: Ryan | Last touched: 2025-10-20
+----------------------------------------------------------------------*/
+
 :root {
+  /* Default font stack using system fonts for performance */
   font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
   font-weight: 400;
 
+  /* Support automatic theme switching (light/dark) */
   color-scheme: light dark;
   color: rgba(255, 255, 255, 0.87);
   background-color: #242424;
 
+  /* Typography and rendering improvements */
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Basic link styling */
 a {
   font-weight: 500;
   color: #646cff;
@@ -22,27 +38,32 @@ a:hover {
   color: #535bf2;
 }
 
-html, body, #root {
-  /* Let the root element fill the entire viewport */
+/* Ensure the root app container fills the viewport */
+html,
+body,
+#root {
   width: 100%;
   height: 100%;
   margin: 0;
   padding: 0;
 }
 
+/* Body layout:
+   - Uses flex so potential header/main/footer can stack vertically.
+   - No centering or min-height (layout handled by React components). */
 body {
-  /* Use flex if you want column layout, but remove the centering */
   display: flex;
-  flex-direction: column;  /* so header/main/footer (if any) stack vertically */
+  flex-direction: column;
   min-width: 320px;
-  /* no more place-items or min-height here */
 }
 
+/* Headings—keep consistent with the dark theme palette */
 h1 {
   font-size: 3.2em;
   line-height: 1.1;
 }
 
+/* Shared button reset and hover feedback */
 button {
   border-radius: 8px;
   border: 1px solid transparent;
@@ -61,6 +82,7 @@ button:focus-visible {
   outline: 4px auto -webkit-focus-ring-color;
 }
 
+/* Light-mode overrides for users preferring bright themes */
 @media (prefers-color-scheme: light) {
   :root {
     color: #213547;
