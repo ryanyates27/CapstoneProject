@@ -6,35 +6,35 @@
 //   1) Query Ensembl REST for genes overlapping a region (dm6).
 //   2) For each Ensembl gene ID, resolve a FlyBase FBgn via Ensembl xrefs.
 //   3) For each FBgn, fetch FlyBase "auto summaries" (public API).
-//   4) Format sponsor-style rows and write a CSV (with BOM for Excel).
+//   4) Optionally enrich with human orthologs (via DIOPT).
+//   5) Optionally fetch UniProt protein function via EBI Proteins API.
+//   6) Format sponsor-style rows and write a CSV (with BOM for Excel).
 // Notes:
 //   • Keep this file UI-free; it should be pure data/FS logic.
 //   • Outbound HTTP is rate-limited to be polite to public APIs.
 //   • CSV is written as UTF-8 with BOM so Excel opens it cleanly.
-// Owner: Ryan | Last touched: 2025-10-20
+// Owner: Ryan | Last touched: 2025-12-09
 //----------------------------------------------------------------------
 
 import axios from "axios";
 import fs from "fs";
 import pThrottle from "p-throttle";
-import path from "path"; // (present in original; currently not used)
+import path from "path"; // kept in case we use it later
 
-/** Rate-limit outbound HTTP calls: max 5 per second. */
-const throttle = pThrottle({ limit: 5, interval: 1000 });
+/** Rate-limit outbound HTTP calls: max 5 per second. */ // CHANGED
+const throttle = pThrottle({ limit: 5, interval: 1000 }); // CHANGED
 
-/**
- * Thin GET wrapper with throttling + JSON accept header.
- * @param {string} url - Fully qualified URL.
- * @param {Record<string, any>} [params] - Querystring parameters.
- * @param {Record<string, string>} [headers] - Extra headers to merge.
- * @returns {Promise<any>} Parsed response data (axios auto-parses JSON).
- */
+// Thin GET wrapper with throttling for JSON APIs (Ensembl, FlyBase auto, DIOPT, UniProt)
 const httpGet = throttle(async (url, params = {}, headers = {}) => {
   const res = await axios.get(url, {
     params,
     timeout: 20000, // 20s network timeout
-    headers: { Accept: "application/json", ...headers },
+    headers: {
+      Accept: "application/json",
+      ...headers, // callers can override if needed
+    },
   });
+  // For JSON APIs, axios parses and returns JS objects here.
   return res.data;
 });
 
@@ -140,18 +140,43 @@ export async function ensemblToFBgn(ensemblGeneId) {
  * }>}
  */
 export async function fetchFlyBaseSummary(fbgnId) {
-  const url = `https://flybase.org/api/gene/summaries/auto/${fbgnId}`;
+  const url = `https://flybase.org/api/gene/summaries/${encodeURIComponent(
+    fbgnId
+  )}`;
+
   try {
     const data = await httpGet(url);
-    const result = data?.resultset?.result?.[0] || {};
-    const summary = result.summary || "";
-    if (!summary) return { fbgnId, summary: "" };
 
-    // Heuristic parsing from the free-text summary:
-    const geneNameMatch = summary.match(/^The gene ([^ ](?:.*?)) is referred/);
-    const symbolMatch = summary.match(/by the symbol\s+([^\s(]+)/);
-    const annotationMatch = summary.match(/\((CG\d+),/);
-    const geneGroupMatch = summary.match(/Gene group:\s*(.*)/i);
+    const result = data?.resultset?.result?.[0] || {};
+
+    // Raw pieces from the API (be forgiving about which field has what)
+    const summaryRaw = result.summary || "";
+    const autoSummaryRaw = result.auto_summary || "";
+    const descriptionRaw = result.description || "";
+
+    // If absolutely nothing text-like exists, bail early
+    if (!summaryRaw && !autoSummaryRaw && !descriptionRaw) {
+      return { fbgnId, summary: "" };
+    }
+
+    // Choose a "best" geneSummary in priority order
+    const geneSummary = summaryRaw || autoSummaryRaw || descriptionRaw || "";
+
+    // Try to pull out some extra structured bits from the main summary text
+    const geneNameMatch =
+      geneSummary.match(/^The gene ([^ ](?:.*?)) is referred/) ||
+      summaryRaw.match(/^The gene ([^ ](?:.*?)) is referred/);
+
+    const symbolMatch =
+      geneSummary.match(/by the symbol\s+([^\s(]+)/) ||
+      summaryRaw.match(/by the symbol\s+([^\s(]+)/);
+
+    const annotationMatch =
+      geneSummary.match(/\((CG\d+),/) || summaryRaw.match(/\((CG\d+),/);
+
+    const geneGroupMatch =
+      geneSummary.match(/Gene group:\s*(.*)/i) ||
+      summaryRaw.match(/Gene group:\s*(.*)/i);
 
     return {
       fbgnId,
@@ -159,14 +184,123 @@ export async function fetchFlyBaseSummary(fbgnId) {
       symbol: symbolMatch ? symbolMatch[1] : "",
       annotationSymbol: annotationMatch ? annotationMatch[1] : "",
       geneGroup: geneGroupMatch ? geneGroupMatch[1] : "",
-      geneSummary: summary,
-      automatedDescription: result.description || "",
-      autoSummary: result.auto_summary || "",
+
+      // Main text fields we expose downstream
+      geneSummary, // our unified best-effort summary
+      automatedDescription: descriptionRaw || "",
+      autoSummary: autoSummaryRaw || "",
+      summary: geneSummary,
     };
   } catch (e) {
-    // Non-fatal: we still return a minimal record so downstream can keep going.
     console.warn(`[FlyBase summaries] ${fbgnId}: ${e?.message || e}`);
     return { fbgnId, summary: "" };
+  }
+}
+
+/* ====================================================================
+   NEW: UniProt protein function via EBI Proteins API (no scraping)
+   ==================================================================== */
+
+/**
+ * Fetch protein function summary from UniProt using the EBI Proteins API.
+ * Mirrors your classmate's getProteinSummary implementation, but goes
+ * through our throttled httpGet helper.
+ *
+ * @param {string} fbgnId FlyBase gene ID (e.g. "FBgn0040070")
+ * @returns {Promise<string>} e.g. "Some function… (UniProt, Q9V3Z4)" or ""
+ */
+export async function fetchUniProtProteinSummary(fbgnId) {
+  if (!fbgnId || typeof fbgnId !== "string") return "";
+
+  const url = `https://www.ebi.ac.uk/proteins/api/proteins/flybase:${encodeURIComponent(
+    fbgnId
+  )}`;
+
+  try {
+    const data = await httpGet(
+      url,
+      { offset: 0, size: 100 },
+      { Accept: "application/json" }
+    );
+
+    if (!Array.isArray(data) || data.length === 0) {
+      // No proteins found for this FlyBase ID
+      return "";
+    }
+
+    const protein = data[0];
+    const proteinId = protein.accession || "Unknown";
+
+    let summary = "";
+    if (Array.isArray(protein.comments)) {
+      const func = protein.comments.find((c) => c.type === "FUNCTION");
+      if (func && Array.isArray(func.text)) {
+        summary = func.text.map((t) => t.value).join(" ");
+      }
+    }
+
+    if (!summary) return "";
+
+    // Single string, similar to your classmate's version.
+    return `${summary} (UniProt, ${proteinId})`;
+  } catch (e) {
+    console.warn(`[UniProt] ${fbgnId}: ${e?.message || e}`);
+    return "";
+  }
+}
+
+/* ====================================================================
+   FBgn → Entrez → Human orthologs (DIOPT)
+   ==================================================================== */
+
+/**
+ * Resolve an Entrez ID from an FBgn using Ensembl xrefs.
+ * @param {string} fbgnId
+ * @returns {Promise<string|null>}
+ */
+export async function fbgnToEntrez(fbgnId) {
+  const url = `https://rest.ensembl.org/xrefs/id/${encodeURIComponent(fbgnId)}`;
+  try {
+    const data = await httpGet(url);
+    if (!Array.isArray(data) || !data.length) return null;
+    const entrezEntry = data.find(
+      (x) => (x.dbname || "").toLowerCase() === "entrezgene"
+    );
+    return entrezEntry?.primary_id || entrezEntry?.id || null;
+  } catch (e) {
+    console.warn(`[fbgnToEntrez] ${fbgnId}: ${e?.message || e}`);
+    return null;
+  }
+}
+
+/**
+ * Query DIOPT for human orthologs of a Drosophila gene (Entrez ID).
+ *
+ * @param {string|null} entrezId
+ * @param {number} [maxOrthologs=3]
+ * @returns {Promise<string[]>} e.g. ["Hsap\\GENE1 (10 of 10)", ...]
+ */
+export async function humanOrthologsFromEntrez(entrezId, maxOrthologs = 3) {
+  if (!entrezId) return [];
+
+  const url = `https://www.flyrnai.org/tools/diopt/web/diopt_api/v9/get_orthologs_from_entrez/7227/${encodeURIComponent(
+    entrezId
+  )}/9606/best_match`;
+
+  try {
+    const data = await httpGet(url);
+    const results = data?.results?.[entrezId];
+    if (!results) return [];
+
+    return Object.values(results)
+      .sort((a, b) => (b.score || 0) - (a.score || 0))
+      .slice(0, maxOrthologs)
+      .map((o) => `Hsap\\${o.symbol} (${o.score} of ${o.max_score})`);
+  } catch (e) {
+    console.warn(
+      `[humanOrthologsFromEntrez] Entrez ${entrezId}: ${e?.message || e}`
+    );
+    return [];
   }
 }
 
@@ -193,7 +327,6 @@ function buildSponsorRows(geneDetails, regionInfo) {
 
 /**
  * Orchestrate the pipeline and save a CSV to disk.
- * Called from main process via IPC after user picks a save path.
  *
  * @param {{chrom:string, start:number, end:number, assembly?:string, savePath:string}} args
  * @returns {Promise<{count:number, savePath:string}>}

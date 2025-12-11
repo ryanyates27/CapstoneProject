@@ -1,4 +1,4 @@
-//FlyMine Template I'm using: https://www.flymine.org/flymine/templates/ChromLocation_Gene
+// FlyMine Template I'm using: https://www.flymine.org/flymine/templates/ChromLocation_Gene
 
 //----------------------------------------------------------------------
 // File: electron/flybaseService.js
@@ -9,25 +9,83 @@
 //   • Keep this file UI-free. It should be pure data fetching/normalization.
 //   • Main process wires IPC to `annotateRegions`.
 //   • Renderer passes rows with either full windows (chrom:start-end) or single positions.
-// Owner: Ryan | Last touched: 2025-10-20
+// Owner: Ryan | Last touched: 2025-12-09
 //----------------------------------------------------------------------
 
 import {
   ensemblOverlapGenes,
   ensemblToFBgn,
   fetchFlyBaseSummary,
+  fbgnToEntrez, // FBgn → Entrez
+  humanOrthologsFromEntrez, // Entrez → human orthologs (DIOPT)
+  fetchUniProtProteinSummary, // NEW: UniProt function via EBI Proteins API
 } from "./pipelineEnsemblFlyBase.js";
 
 // FlyMine PathQuery endpoint (InterMine API)
-const FLYMINE_ENDPOINT = "https://www.flymine.org/flymine/service/query/results";
+const FLYMINE_ENDPOINT =
+  "https://www.flymine.org/flymine/service/query/results";
+
+// NEW: Alliance of Genome Resources — automated description for a FlyBase FBgn
+async function fetchAllianceAutomatedDescription(fbgnId) {
+  if (!fbgnId || !/^FBgn/i.test(fbgnId)) return null; // expect "FBgn0040070" only  // NEW
+
+  const allianceId = `FB:${fbgnId}`; // Alliance expects "FB:FBgn0040070"        // NEW
+  const url = `https://www.alliancegenome.org/api/gene/${encodeURIComponent(
+    allianceId
+  )}`; // NEW
+
+  try {
+    const res = await fetch(url, {
+      headers: { Accept: "application/json" }, // NEW
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => ""); // NEW
+      console.warn(
+        "[fetchAllianceAutomatedDescription] HTTP",
+        res.status,
+        res.statusText,
+        txt.slice(0, 200)
+      );
+      return null; // NEW
+    }
+
+    const data = await res.json().catch(() => null); // NEW
+    if (!data) return null; // NEW
+
+    const automatedDescription =
+      typeof data.automatedGeneSynopsis === "string"
+        ? data.automatedGeneSynopsis.trim()
+        : ""; // NEW
+
+    const allianceSymbol =
+      typeof data.symbol === "string" ? data.symbol.trim() : ""; // NEW
+    const allianceName = typeof data.name === "string" ? data.name.trim() : ""; // NEW
+
+    return {
+      automatedDescription, // NEW
+      allianceSymbol,
+      allianceName,
+      raw: data,
+    };
+  } catch (err) {
+    console.warn(
+      "[fetchAllianceAutomatedDescription] failed",
+      fbgnId,
+      err?.message || err
+    ); // NEW
+    return null;
+  }
+}
 
 /**
  * Build a FlyMine PathQuery payload for "genes overlapping a region".
- * WHY: InterMine expects a PathQuery object (model/from/select/where/sortOrder).
- * @param {{chrom:string,start:number,end:number,organism?:string}} args
- * @returns {object} PathQuery JSON
  */
-function buildOverlapPQ({ chrom, start, end, organism = "Drosophila melanogaster" }) {
+function buildOverlapPQ({
+  chrom,
+  start,
+  end,
+  organism = "Drosophila melanogaster",
+}) {
   return {
     model: { name: "genomic" },
     from: "Gene",
@@ -50,25 +108,18 @@ function buildOverlapPQ({ chrom, start, end, organism = "Drosophila melanogaster
 
 /**
  * Query FlyMine for genes overlapping a region and normalize fields.
- * WHY: FlyMine sometimes returns slightly different shapes; we normalize to a stable row.
+ *
+ * Enrichment (now via FlyBase summaries API + UniProt JSON API + Alliance):
+ *   • If gene_id is FBgn, attach:
+ *       gene_name, annotation_symbol, gene_group, curated_summary,
+ *       automated_description (Alliance-first), auto_summary, gene_summary,
+ *       protein_function (UniProt)
  *
  * @param {{chrom:string,start:number,end:number}} region
- * @returns {Promise<Array<{
- *   source: "flymine:overlaps",
- *   gene_id: string,
- *   symbol: string,
- *   chrom: string,
- *   start: number|null,
- *   end: number|null,
- *   strand: string|number,
- *   human_orthologs: string[]
- * }>>}
- * @throws {Error} when FlyMine responds non-OK
  */
 export async function fetchGenesForRegionOverlap({ chrom, start, end }) {
   const pq = buildOverlapPQ({ chrom, start, end });
 
-  // InterMine endpoints accept x-www-form-urlencoded with a "query" JSON string.
   const form = new URLSearchParams();
   form.set("query", JSON.stringify(pq));
   form.set("format", "json");
@@ -82,57 +133,115 @@ export async function fetchGenesForRegionOverlap({ chrom, start, end }) {
   });
 
   if (!res.ok) {
-    // Return server text when available — helps troubleshooting template/path errors.
     const txt = await res.text().catch(() => "");
-    throw new Error(`FlyMine query failed: ${res.status} ${res.statusText}\n${txt}`);
+    throw new Error(
+      `FlyMine query failed: ${res.status} ${res.statusText}\n${txt}`
+    );
   }
 
-  // InterMine may wrap in {results:[…]} or return the array directly.
   const data = await res.json();
   const rows = Array.isArray(data) ? data : data.results ?? data;
 
-  // Normalize result row shape into our stable schema.
-  return (rows || []).map((row) => {
-    // Some responses prefix keys with "Gene." or nest under row.Gene — unify access.
-    const get = (k) =>
-      row[k] ??
-      row[k?.replace(/^Gene\./, "")] ??
-      row.Gene?.[k?.split(".").slice(1).join(".")] ??
-      null;
+  const genes = await Promise.all(
+    (rows || []).map(async (row) => {
+      const get = (k) =>
+        row[k] ??
+        row[k?.replace(/^Gene\./, "")] ??
+        row.Gene?.[k?.split(".").slice(1).join(".")] ??
+        null;
 
-    return {
-      source: "flymine:overlaps",
-      gene_id: get("Gene.primaryIdentifier") || get("primaryIdentifier") || "",
-      symbol: get("Gene.symbol") || get("symbol") || "",
-      chrom:
-        get("Gene.chromosomeLocation.locatedOn.primaryIdentifier") ||
-        get("chromosomeLocation.locatedOn.primaryIdentifier") ||
-        "",
-      start: Number(get("Gene.chromosomeLocation.start") || get("chromosomeLocation.start")) || null,
-      end: Number(get("Gene.chromosomeLocation.end") || get("chromosomeLocation.end")) || null,
-      strand: get("Gene.chromosomeLocation.strand") || get("chromosomeLocation.strand") || "",
-      human_orthologs: [], // reserved for future enrichment
-    };
-  });
+      const gene_id =
+        get("Gene.primaryIdentifier") || get("primaryIdentifier") || "";
+
+      const gene = {
+        source: "flymine:overlaps",
+        gene_id,
+        symbol: get("Gene.symbol") || get("symbol") || "",
+        chrom:
+          get("Gene.chromosomeLocation.locatedOn.primaryIdentifier") ||
+          get("chromosomeLocation.locatedOn.primaryIdentifier") ||
+          "",
+        start:
+          Number(
+            get("Gene.chromosomeLocation.start") ||
+              get("chromosomeLocation.start")
+          ) || null,
+        end:
+          Number(
+            get("Gene.chromosomeLocation.end") || get("chromosomeLocation.end")
+          ) || null,
+        strand:
+          get("Gene.chromosomeLocation.strand") ||
+          get("chromosomeLocation.strand") ||
+          "",
+        human_orthologs: [],
+      };
+
+      // Enrichment for FBgn IDs via FlyBase summaries + UniProt + Alliance
+      if (gene_id && /^FBgn/i.test(gene_id)) {
+        try {
+          // CHANGED: add Alliance to the enrichment bundle
+          const [auto, uniProtFn, alliance] = await Promise.all([
+            fetchFlyBaseSummary(gene_id),
+            fetchUniProtProteinSummary(gene_id),
+            fetchAllianceAutomatedDescription(gene_id),
+          ]); // CHANGED
+
+          const allianceText = alliance?.automatedDescription || ""; // NEW
+
+          Object.assign(gene, {
+            gene_name: auto?.geneName || "",
+            annotation_symbol: auto?.annotationSymbol || "",
+
+            // Treat the API geneSummary as both curated+auto for now
+            curated_summary: auto?.geneSummary || auto?.summary || "",
+            gene_summary: auto?.geneSummary || auto?.summary || "",
+
+            // CHANGED: Automated Description prefers Alliance
+            automated_description:
+              allianceText ||
+              auto?.automatedDescription ||
+              auto?.autoSummary ||
+              auto?.geneSummary ||
+              "", // CHANGED
+
+            // Automatically generated summary (FlyBase)
+            auto_summary: auto?.geneSummary || auto?.autoSummary || "",
+
+            // Gene Group text from summaries API
+            gene_group: auto?.geneGroup || "",
+
+            // Protein function from UniProt JSON API
+            protein_function: uniProtFn || "",
+
+            // OPTIONAL Alliance metadata
+            alliance_symbol: alliance?.allianceSymbol || "", // NEW
+            alliance_name: alliance?.allianceName || "", // NEW
+          });
+        } catch (err) {
+          console.warn(
+            "FlyBase/UniProt/Alliance enrichment failed",
+            gene_id,
+            err
+          );
+        }
+      }
+      return gene;
+    })
+  );
+
+  return genes;
 }
 
 /**
  * Fallback pipeline when FlyMine returns no hits:
- *   Ensembl overlap → Ensembl→FBgn xref → FlyBase auto summary polish.
- * WHY: Some services only return a gene if the window spans the entire gene.
- *      Ensembl overlap is more permissive and often finds candidates near a locus.
+ *   Ensembl overlap → Ensembl→FBgn xref → FlyBase auto summary.
  *
- * @param {{chrom:string,start:number,end:number}} region
- * @returns {Promise<Array<{
- *   source: "ensembl"|"ensembl→flybase",
- *   gene_id: string,            // FBgn if mapped, else Ensembl gene id
- *   symbol: string,
- *   chrom: string,
- *   start: number|null,
- *   end: number|null,
- *   strand: string,
- *   human_orthologs: string[]
- * }>>}
+ * Enrichment (no HTML scraping):
+ *   • FlyBase summary fields (similar to FlyMine path).
+ *   • UniProt protein function (EBI Proteins API).
+ *   • Alliance automated description.
+ *   • Human orthologs via DIOPT (FBgn → Entrez → human).
  */
 export async function fallbackEnsemblGenesForRegion({ chrom, start, end }) {
   const overlaps = await ensemblOverlapGenes({ chrom, start, end });
@@ -140,25 +249,57 @@ export async function fallbackEnsemblGenesForRegion({ chrom, start, end }) {
 
   const out = [];
   for (const g of overlaps) {
-    // Map Ensembl gene → FBgn when possible.
     let fbgn = null;
     try {
       fbgn = await ensemblToFBgn(g.ensembl_id);
-    } catch { /* best-effort mapping */ }
-
-    // Guard: only accept true FBgn identifiers.
-    if (fbgn && !/^FBgn/i.test(fbgn)) fbgn = null;
-
-    // Prefer FlyBase symbol if we have an FBgn; it’s often cleaner/more canonical.
-    let polishedSymbol = g.symbol || "";
-    if (fbgn && /^FBgn/i.test(fbgn)) {
-      try {
-        const s = await fetchFlyBaseSummary(fbgn);
-        if (s?.symbol) polishedSymbol = s.symbol;
-      } catch { /* summaries are best-effort */ }
+    } catch {
+      /* best-effort mapping */
     }
 
-    out.push({
+    if (fbgn && !/^FBgn/i.test(fbgn)) fbgn = null;
+
+    let polishedSymbol = g.symbol || "";
+    let flybaseSummary = null;
+    let uniProtFn = ""; // NEW
+    let allianceAuto = null; // NEW
+
+    if (fbgn && /^FBgn/i.test(fbgn)) {
+      try {
+        // CHANGED: include Alliance helper in enrichment
+        const [s, pf, alliance] = await Promise.all([
+          fetchFlyBaseSummary(fbgn),
+          fetchUniProtProteinSummary(fbgn),
+          fetchAllianceAutomatedDescription(fbgn),
+        ]); // CHANGED
+        flybaseSummary = s || null;
+        uniProtFn = pf || "";
+        allianceAuto = alliance || null; // NEW
+        if (s?.symbol) polishedSymbol = s.symbol;
+      } catch (e) {
+        console.warn(
+          `[fallbackEnsemblGenesForRegion] FlyBase/UniProt/Alliance enrichment failed for ${fbgn}:`,
+          e?.message || e
+        );
+      }
+    }
+
+    // DIOPT human orthologs (optional)
+    let human_orthologs = [];
+    if (fbgn) {
+      try {
+        const entrez = await fbgnToEntrez(fbgn);
+        if (entrez) {
+          human_orthologs = await humanOrthologsFromEntrez(entrez, 3);
+        }
+      } catch (e) {
+        console.warn(
+          `[fallbackEnsemblGenesForRegion] DIOPT lookup failed for ${fbgn}:`,
+          e?.message || e
+        );
+      }
+    }
+
+    const gene = {
       source: fbgn ? "ensembl→flybase" : "ensembl",
       gene_id: fbgn || g.ensembl_id,
       symbol: polishedSymbol || "",
@@ -166,49 +307,70 @@ export async function fallbackEnsemblGenesForRegion({ chrom, start, end }) {
       start: g.start ?? null,
       end: g.end ?? null,
       strand: g.strand ?? "",
-      human_orthologs: [],
-    });
+      human_orthologs,
+    };
+
+    // Attach FlyBase + Alliance enrichment if we have it
+    if (flybaseSummary) {
+      Object.assign(gene, {
+        gene_name: flybaseSummary?.geneName || "",
+        annotation_symbol: flybaseSummary?.annotationSymbol || "",
+
+        gene_group: flybaseSummary?.geneGroup || "",
+
+        curated_summary:
+          flybaseSummary?.geneSummary || flybaseSummary?.summary || "",
+        gene_summary:
+          flybaseSummary?.geneSummary || flybaseSummary?.summary || "",
+
+        // CHANGED: prefer Alliance description; fall back to FlyBase fields
+        automated_description:
+          allianceAuto?.automatedDescription ||
+          flybaseSummary?.automatedDescription ||
+          flybaseSummary?.autoSummary ||
+          flybaseSummary?.geneSummary ||
+          "", // CHANGED
+
+        auto_summary:
+          flybaseSummary?.geneSummary || flybaseSummary?.autoSummary || "",
+
+        // Protein function from UniProt JSON API
+        protein_function: uniProtFn || "",
+
+        alliance_symbol: allianceAuto?.allianceSymbol || "", // NEW
+        alliance_name: allianceAuto?.allianceName || "", // NEW
+      });
+    } else {
+      // Even if FlyBase summary failed, keep UniProt function if we got it.
+      if (uniProtFn) {
+        gene.protein_function = uniProtFn;
+      }
+    }
+
+    out.push(gene);
   }
   return out;
 }
 
 /**
  * Top-level batch annotator used by the main process IPC.
- * Input rows may be:
- *   • full windows: { chrom, start, end }
- *   • single positions: { chrom, pos } or encoded strings in `coordinate`
- * The function:
- *   1) Normalizes each row to a region window: [pos-radius, pos+radius] if needed.
- *   2) Tries FlyMine OVERLAPS.
- *   3) Falls back to Ensembl→FBgn→FlyBase if FlyMine is empty/fails.
- *
- * @param {{assembly?:string, radius?:number, rows:Array<any>}} payload
- * @returns {Promise<{ok:true, count:number, items:Array<{
- *   input:any,
- *   region?:{chrom:string,start:number,end:number,assembly:string},
- *   genes?:Array<any>,
- *   error?:string
- * }>}>>}
- * @throws {Error} when unsupported assemblies are requested
  */
 export async function annotateRegions(payload) {
   const { assembly = "dm6", rows = [], radius: payloadRadius } = payload || {};
 
-  // Guard assembly up front to keep downstream calls simple.
   if (assembly !== "dm6") throw new Error(`Unsupported assembly: ${assembly}`);
 
-  // Single-position rows expand to a window of ±radius (default 5kb).
   const defaultRadius = 5000;
-  const rad = Number.isFinite(Number(payloadRadius)) ? Number(payloadRadius) : defaultRadius;
+  const rad = Number.isFinite(Number(payloadRadius))
+    ? Number(payloadRadius)
+    : defaultRadius;
 
   const out = [];
   for (const r of rows) {
-    // Accept multiple input shapes. Prefer explicit chrom/start/end, else parse a coordinate string.
     let chrom = r.chrom;
     let start = r.start;
     let end = r.end;
 
-    // e.g., "2L:12345-67890"
     if (!chrom && r.coordinate) {
       const m = String(r.coordinate).match(/^([^:]+):(\d+)(?:-(\d+))?$/);
       if (m) {
@@ -218,14 +380,12 @@ export async function annotateRegions(payload) {
       }
     }
 
-    // If only a single position is present, inflate to a symmetric window by radius.
     if (!end && (start || r.pos)) {
       const pos = start ?? r.pos;
       start = Math.max(1, pos - rad);
       end = pos + rad;
     }
 
-    // Validate before calling services.
     if (!chrom || start == null || end == null) {
       out.push({ input: r, error: "Invalid or missing coordinates" });
       continue;
@@ -234,14 +394,12 @@ export async function annotateRegions(payload) {
     try {
       let genes = [];
 
-      // First attempt: FlyMine overlap (often stricter; may require full-gene windows)
       try {
         genes = await fetchGenesForRegionOverlap({ chrom, start, end });
       } catch {
-        // Swallow FlyMine errors here so we can still try the fallback path.
+        // ignore FlyMine errors, fall through to Ensembl
       }
 
-      // Fallback: Ensembl overlap → FBgn map → FlyBase summary
       if (!genes?.length) {
         genes = await fallbackEnsemblGenesForRegion({ chrom, start, end });
       }
